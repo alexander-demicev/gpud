@@ -17,6 +17,7 @@ import (
 	apiv1 "github.com/leptonai/gpud/api/v1"
 	"github.com/leptonai/gpud/components"
 	"github.com/leptonai/gpud/pkg/eventstore"
+	pkghost "github.com/leptonai/gpud/pkg/host"
 	"github.com/leptonai/gpud/pkg/log"
 	nvidianvml "github.com/leptonai/gpud/pkg/nvidia/nvml"
 	"github.com/leptonai/gpud/pkg/nvidia/nvml/device"
@@ -27,12 +28,14 @@ const (
 	Name = "accelerator-nvidia-hw-slowdown"
 
 	// DefaultStateHWSlowdownEvaluationWindow is the window to evaluate the HW slowdown state.
-	DefaultStateHWSlowdownEvaluationWindow = 10 * time.Minute
+	DefaultStateHWSlowdownEvaluationWindow = 3 * time.Hour
 
-	// DefaultStateHWSlowdownEventsThresholdFrequencyPerMinute is the threshold frequency of the HW slowdown events per minute.
-	// If the evaluation window is 10 minutes and for the last 10-minute, 6 events are found, the state is considered unhealthy, where the ratio is 0.6 = 6 / 10.
-	// This is to avoid false positives when the HW slowdown events are rare.
-	DefaultStateHWSlowdownEventsThresholdFrequencyPerMinute = 0.6
+	// DefaultStateHWSlowdownEventsThresholdFrequencyPerMinute is how much slowdown counts as
+	// "too much". It is a rate: (distinct minutes that had a HW slowdown since boot) /
+	// (window length in minutes). The GPU is marked unhealthy when that rate is >= this value.
+	// With the 3h (180 min) window, 0.015 means "3 or more slowdown-minutes since boot"
+	// (3 / 180 = 0.0167 trips it; 2 / 180 = 0.0111 stays healthy).
+	DefaultStateHWSlowdownEventsThresholdFrequencyPerMinute = 0.015
 )
 
 var _ components.Component = &component{}
@@ -42,6 +45,9 @@ type component struct {
 	cancel context.CancelFunc
 
 	getTimeNowFunc func() time.Time
+	// getBootTimeFunc returns the host boot time; slowdowns from before it are ignored, which is
+	// what resets the state on reboot. Overridable in tests.
+	getBootTimeFunc func() time.Time
 
 	nvmlInstance                  nvidianvml.Instance
 	getClockEventsSupportedFunc   func(dev device.Device) (bool, error)
@@ -74,6 +80,7 @@ func New(gpudInstance *components.GPUdInstance) (components.Component, error) {
 		getTimeNowFunc: func() time.Time {
 			return time.Now().UTC()
 		},
+		getBootTimeFunc: pkghost.BootTime,
 
 		nvmlInstance:                     gpudInstance.NVMLInstance,
 		getClockEventsSupportedFunc:      ClockEventsSupportedByDevice,
@@ -362,7 +369,17 @@ func (c *component) Check() components.CheckResult {
 		return cr
 	}
 
+	// Health here comes from the slowdown events we've stored since the last boot, not from the
+	// live slowdown bit. That bit flips on and off constantly so instead every slowdown we catch
+	// gets written to the DB above and is never deleted. The count only climbs from there: once
+	// we've seen slowdowns in enough separate minutes to cross the threshold below, the node goes
+	// unhealthy and stays that way even after the GPU looks fine again. A reboot is what clears it.
 	since := c.getTimeNowFunc().Add(-c.freqPerMinEvaluationWindow)
+	if c.getBootTimeFunc != nil {
+		if bootTime := c.getBootTimeFunc(); !bootTime.IsZero() {
+			since = bootTime
+		}
+	}
 	cctx, ccancel := context.WithTimeout(c.ctx, 15*time.Second)
 	latestEvents, err := c.eventBucket.Get(cctx, since)
 	ccancel()
@@ -392,13 +409,13 @@ func (c *component) Check() components.CheckResult {
 	if freqPerMin < c.freqPerMinThreshold {
 		// hw slowdown events happened but within its threshold
 		cr.health = apiv1.HealthStateTypeHealthy
-		cr.reason = fmt.Sprintf("hw slowdown events frequency per minute %.2f (total events per minute count %d) is less than threshold %.2f for the last %s", freqPerMin, totalEvents, c.freqPerMinThreshold, c.freqPerMinEvaluationWindow)
+		cr.reason = fmt.Sprintf("hw slowdown events frequency per minute %.4f (total slowdown minutes %d) is less than threshold %.4f for the last %s", freqPerMin, totalEvents, c.freqPerMinThreshold, c.freqPerMinEvaluationWindow)
 		return cr
 	}
 
 	// hw slowdown events happened and beyond its threshold
 	cr.health = apiv1.HealthStateTypeUnhealthy
-	cr.reason = fmt.Sprintf("hw slowdown events frequency per minute %.2f (total events per minute count %d) exceeded threshold %.2f for the last %s", freqPerMin, totalEvents, c.freqPerMinThreshold, c.freqPerMinEvaluationWindow)
+	cr.reason = fmt.Sprintf("hw slowdown events frequency per minute %.4f (total slowdown minutes %d) exceeded threshold %.4f for the last %s", freqPerMin, totalEvents, c.freqPerMinThreshold, c.freqPerMinEvaluationWindow)
 	cr.suggestedActions = &apiv1.SuggestedActions{
 		// Hardware slowdown are often caused by GPU overheating or power supply unit (PSU) failing, please do a hardware inspection to mitigate the issue
 		RepairActions: []apiv1.RepairActionType{
